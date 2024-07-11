@@ -98,4 +98,17 @@ impl AnyController {
             AnyController::Cubic(c) => c,
         }
     }
+
+    #[inline]
+    pub fn congestion_window(&self) -> Option<usize> {
+        match self {
+            AnyController::None(n) => None,
+
+            #[cfg(feature = "socket-tcp-reno")]
+            AnyController::Reno(r) => Some(r.window()),
+
+            #[cfg(feature = "socket-tcp-cubic")]
+            AnyController::Cubic(c) => Some(c.window()),
+        }
+    }
 }

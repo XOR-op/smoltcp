@@ -639,6 +639,12 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// Return the current congestion window size reported by the congestion control algorithm.
+    /// If no congestion control algorithm is set, `None` is returned.
+    pub fn congestion_window(&self) -> Option<usize> {
+        self.congestion_controller.congestion_window()
+    }
+
     /// Register a waker for receive operations.
     ///
     /// The waker is woken on state changes that might affect the return value
