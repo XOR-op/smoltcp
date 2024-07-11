@@ -2581,6 +2581,11 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// Estimated round-trip time in milliseconds.
+    pub fn estimated_rtt(&self) -> u32 {
+        self.rtte.rtt
+    }
+
     /// Replace the receive buffer with a new one.
     ///
     /// The requirements for the new buffer are:
