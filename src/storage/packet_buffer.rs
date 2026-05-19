@@ -154,11 +154,14 @@ impl<'a, H> PacketBuffer<'a, H> {
             }
         }
 
+        let metadata_slot = self.metadata_ring.enqueue_one()?;
+
+        // Only call f once we know that we will succeed
         let (size, _) = self
             .payload_ring
             .enqueue_many_with(|data| (f(&mut data[..max_size]), ()));
 
-        *self.metadata_ring.enqueue_one()? = PacketMetadata::packet(size, header);
+        *metadata_slot = PacketMetadata::packet(size, header);
 
         Ok(size)
     }
