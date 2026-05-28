@@ -64,13 +64,28 @@ fn netsim() {
 fn netsim_multiflow() {
     setup_logging();
 
-    let bandwidth: u64 = 10_000_000 / 8;
+    let flow_counts = [1, 2, 4, 16, 32, 64];
+
+    // link
+    let bandwidth: u64 = 200_000_000 / 8;
     let rtt = Duration::from_millis(100);
-    let capacity = (bandwidth * rtt.total_micros() / 1_000_000) as usize;
-    let buffer = 32 * 1024;
+    let queue = 64 * 1024;
+    let wire_loss = 0.0;
+
+    // flow
+    let buffer = 256 * 1024;
     let bytes_per_flow = 2 * 1024 * 1024;
 
-    let flow_counts = [1, 2, 4, 16, 32, 64];
+    let mss = 1460;
+    let bdp = (bandwidth * rtt.total_micros() / 1_000_000) as usize;
+    let max_flows = *flow_counts.iter().max().unwrap();
+    let cwnd_peak = ((bdp + queue) / max_flows).min(buffer);
+
+    debug_assert!(
+        cwnd_peak >= 16 * mss,
+        "cwnd_peak at N={max_flows} is {} MSS",
+        cwnd_peak / mss
+    );
 
     let mut results = Vec::with_capacity(flow_counts.len());
     for flow_count in flow_counts {
@@ -82,7 +97,7 @@ fn netsim_multiflow() {
                         (rtt.total_millis() as f64 * rng.gen_range(0.5..=1.5)) as u64,
                     )
                 }),
-                loss: 0.0,
+                loss: wire_loss,
                 bytes: bytes_per_flow,
                 seed_a_to_b: (i * 2) as u64,
                 seed_b_to_a: (i * 2 + 1) as u64,
@@ -95,7 +110,7 @@ fn netsim_multiflow() {
             flows: flow_specs,
             buffer,
             bandwidth,
-            capacity,
+            capacity: queue,
         };
 
         let result = run_test(test_spec);
