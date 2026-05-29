@@ -197,6 +197,11 @@ impl RttEstimator {
         Duration::from_millis(self.rto as _)
     }
 
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn smoothed_rtt(&self) -> u32 {
+        if self.have_measurement { self.srtt } else { 0 }
+    }
+
     fn sample(&mut self, new_rtt: u32) {
         if self.have_measurement {
             // RFC 6298 (2.3) When a subsequent RTT measurement R' is made, a host MUST set (...)
