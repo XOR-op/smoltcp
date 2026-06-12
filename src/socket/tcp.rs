@@ -551,6 +551,15 @@ pub struct Socket<'a> {
 
 const DEFAULT_MSS: usize = 536;
 
+/// Minimum MSS we accept from the remote, same value as Linux's `TCP_MIN_SND_MSS`.
+/// Without it, a peer advertising a tiny MSS could force segments to carry little
+/// or no payload once the TCP options length is subtracted from the effective MSS,
+/// stalling the connection in an endless stream of empty segments.
+///
+/// Must exceed the maximum possible length of the TCP options (currently 12, for
+/// timestamps) so that every segment carries some payload.
+const MIN_REMOTE_MSS: usize = 48;
+
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
@@ -1880,14 +1889,13 @@ impl<'a> Socket<'a> {
             (State::Listen, TcpControl::Syn) => {
                 tcp_trace!("received SYN");
                 if let Some(max_seg_size) = repr.max_seg_size {
-                    if max_seg_size == 0 {
-                        tcp_trace!("received SYNACK with zero MSS, ignoring");
-                        return None;
+                    // Treat a zero MSS as if the option were absent, like Linux does.
+                    if max_seg_size != 0 {
+                        self.remote_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS);
+                        self.congestion_controller
+                            .inner_mut()
+                            .set_mss(self.remote_mss);
                     }
-                    self.congestion_controller
-                        .inner_mut()
-                        .set_mss(max_seg_size as usize);
-                    self.remote_mss = max_seg_size as usize
                 }
 
                 self.tuple = Some(Tuple {
@@ -1934,14 +1942,13 @@ impl<'a> Socket<'a> {
                     tcp_trace!("received SYN");
                 }
                 if let Some(max_seg_size) = repr.max_seg_size {
-                    if max_seg_size == 0 {
-                        tcp_trace!("received SYNACK with zero MSS, ignoring");
-                        return None;
+                    // Treat a zero MSS as if the option were absent, like Linux does.
+                    if max_seg_size != 0 {
+                        self.remote_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS);
+                        self.congestion_controller
+                            .inner_mut()
+                            .set_mss(self.remote_mss);
                     }
-                    self.remote_mss = max_seg_size as usize;
-                    self.congestion_controller
-                        .inner_mut()
-                        .set_mss(self.remote_mss);
                 }
 
                 self.remote_seq_no = repr.seq_number + 1;
@@ -2270,11 +2277,15 @@ impl<'a> Socket<'a> {
             IpAddress::Ipv6(_) => crate::wire::IPV6_HEADER_LEN,
         };
 
-        // Max segment size we're able to send due to MTU limitations.
-        let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
+        // The effective max segment size, taking into account the options and the local and remote limits.
+        let options_len = if self.tsval_generator.is_some() {
+            12
+        } else {
+            0
+        };
 
-        // The effective max segment size, taking into account our and remote's limits.
-        let effective_mss = local_mss.min(self.remote_mss);
+        let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
+        let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
         // Have we sent data that hasn't been ACKed yet?
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
@@ -2578,9 +2589,11 @@ impl<'a> Socket<'a> {
                 // 1. remote window
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
                 // 3. MSS we can send, determined by our MTU.
-                let size = win_limit
-                    .min(self.remote_mss)
-                    .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
+                let options_len = repr.header_len() - TCP_HEADER_LEN;
+
+                let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
+                let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
+                let size = win_limit.min(effective_mss);
 
                 let offset = self.remote_last_seq - self.local_seq_no;
                 repr.payload = self.tx_buffer.get_allocated(offset, size);
@@ -3314,6 +3327,40 @@ mod test {
     }
 
     #[test]
+    fn test_listen_syn_tiny_mss_is_clamped() {
+        let mut s = socket_listen();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                max_seg_size: Some(10),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::SynReceived);
+        assert_eq!(s.remote_mss, MIN_REMOTE_MSS);
+    }
+
+    #[test]
+    fn test_listen_syn_zero_mss_is_ignored() {
+        let mut s = socket_listen();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                max_seg_size: Some(0),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::SynReceived);
+        assert_eq!(s.remote_mss, DEFAULT_MSS);
+    }
+
+    #[test]
     fn test_listen_sanity() {
         let mut s = socket();
         s.listen(LOCAL_PORT).unwrap();
@@ -3721,6 +3768,74 @@ mod test {
             }
         );
         assert_eq!(s.tuple, Some(TUPLE));
+    }
+
+    #[test]
+    fn test_connect_synack_tiny_mss_is_clamped() {
+        let mut s = socket();
+        s.local_seq_no = LOCAL_SEQ;
+        s.socket
+            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
+            .unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                max_seg_size: Some(10),
+                window_scale: Some(0),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.remote_mss, MIN_REMOTE_MSS);
+    }
+
+    #[test]
+    fn test_connect_synack_zero_mss_is_ignored() {
+        let mut s = socket();
+        s.local_seq_no = LOCAL_SEQ;
+        s.socket
+            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
+            .unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                max_seg_size: Some(0),
+                window_scale: Some(0),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.remote_mss, DEFAULT_MSS);
     }
 
     #[test]
@@ -4980,6 +5095,106 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Established);
+    }
+
+    #[test]
+    fn test_established_options_reduce_payload_when_local_mss_limited() {
+        const EFFECTIVE_MSS: usize = 64;
+
+        // construct socket where remote MSS is less than local MSS
+        let mut s = socket_established();
+        s.set_tsval_generator(Some(|| 1));
+        s.remote_mss = EFFECTIVE_MSS;
+
+        // Payload should contain 12 bytes less due to timestamp
+        s.send_slice(&[0; EFFECTIVE_MSS]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0; EFFECTIVE_MSS - 12],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_established_options_reduce_payload_when_remote_mss_limited() {
+        const EFFECTIVE_MSS: usize = BASE_MSS as usize;
+
+        // construct socket where remote MSS is more than local MSS
+        let mut s = socket_established_with_buffer_sizes(EFFECTIVE_MSS, 64);
+        s.set_tsval_generator(Some(|| 1));
+        s.remote_mss = 9999;
+        s.remote_win_len = 9999;
+
+        // Payload should contain 12 bytes less due to timestamp
+        s.send_slice(&[0; EFFECTIVE_MSS]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0; EFFECTIVE_MSS - 12],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_established_tiny_mss_with_options_makes_progress() {
+        // Connect with timestamps enabled to a remote advertising an absurdly
+        // small MSS. Without the MIN_SND_MSS clamp, an MSS smaller than the
+        // options length would result in an effective MSS of zero, sending
+        // empty segments in a loop without ever making progress.
+        let mut s = socket();
+        s.set_tsval_generator(Some(|| 1));
+        s.local_seq_no = LOCAL_SEQ;
+        s.socket
+            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
+            .unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                max_seg_size: Some(10),
+                window_scale: Some(0),
+                timestamp: Some(TcpTimestampRepr::new(500, 1)),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.remote_mss, MIN_REMOTE_MSS);
+
+        s.send_slice(&[0; 64]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0; MIN_REMOTE_MSS - 12],
+                timestamp: Some(TcpTimestampRepr::new(1, 500)),
+                ..RECV_TEMPL
+            }]
+        );
     }
 
     #[test]
@@ -8839,6 +9054,43 @@ mod test {
                 seq_number: LOCAL_SEQ + 1 + 6 + 6 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &b"ccc"[..],
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_nagle_works_with_reduced_payload_from_options() {
+        const EFFECTIVE_MSS: usize = 64;
+
+        let mut s = socket_established_with_buffer_sizes(256, 64);
+        s.set_nagle_enabled(true);
+        s.set_tsval_generator(Some(|| 1));
+        s.remote_mss = EFFECTIVE_MSS;
+
+        // Send small segment to "arm" Nagle's
+        s.send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abcdef"[..],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                ..RECV_TEMPL
+            }]
+        );
+
+        // A full segment (once options are accounted for) should not be delayed and contain 12 bytes less due to timestamp
+        s.send_slice(&[0; EFFECTIVE_MSS - 12]).unwrap();
+        recv!(
+            s,
+            time 0,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0; EFFECTIVE_MSS - 12],
+                timestamp: Some(TcpTimestampRepr::new(1, 0)),
                 ..RECV_TEMPL
             }]
         );
