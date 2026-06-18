@@ -2936,19 +2936,25 @@ impl<'a> Socket<'a> {
         new_buffer: T,
     ) -> Result<SocketBuffer<'a>, SocketBuffer<'a>> {
         let mut replaced_buf = new_buffer.into();
-        /* Check if the new buffer is valid
-         * Requirements:
-         * 1. The new buffer must be larger than the length of remaining data in the current buffer
-         * 2. The new buffer must be multiple of (1 << self.remote_win_shift)
-         */
-        if replaced_buf.capacity() < self.rx_buffer.len()
+        // The new buffer must be able to hold both contiguous queued data and
+        // any out-of-order data that the assembler is currently tracking.
+        let required_capacity = self.rx_buffer.len()
+            + self
+                .assembler
+                .iter_data()
+                .map(|(_, end)| end)
+                .max()
+                .unwrap_or(0);
+
+        if replaced_buf.capacity() < required_capacity
             || replaced_buf.capacity() % (1 << self.remote_win_shift) != 0
         {
             return Err(replaced_buf);
         }
         replaced_buf.clear();
 
-        // We should copy both allocated data and unallocated data (for assembler)
+        // Preserve queued data. This may wrap in the old ring buffer, so copy it
+        // in up to two contiguous chunks.
         let allocated1 = self.rx_buffer.get_allocated(0, self.rx_buffer.len());
         let l = replaced_buf.enqueue_slice(allocated1);
         assert_eq!(l, allocated1.len());
@@ -2960,17 +2966,21 @@ impl<'a> Socket<'a> {
             assert_eq!(l, allocated2.len());
         }
 
-        // make sure assembler can work properly
-        let unallocated1 = self.rx_buffer.get_unallocated(0, self.rx_buffer.window());
-        let unallocated1_len = unallocated1.len();
-        let l = replaced_buf.write_unallocated(0, unallocated1);
-        assert_eq!(l, unallocated1.len());
-        if unallocated1_len < self.rx_buffer.window() {
-            let unallocated2 = self
-                .rx_buffer
-                .get_unallocated(unallocated1_len, self.rx_buffer.window() - unallocated1_len);
-            let l = replaced_buf.write_unallocated(unallocated1_len, unallocated2);
-            assert_eq!(l, unallocated2.len());
+        // Preserve only out-of-order data tracked by the assembler. The rest of
+        // the unallocated window is scratch space and does not need copying.
+        for (start, end) in self.assembler.iter_data() {
+            let mut offset = start;
+            while offset < end {
+                let copied = {
+                    let unallocated = self.rx_buffer.get_unallocated(offset, end - offset);
+                    let len = unallocated.len();
+                    let l = replaced_buf.write_unallocated(offset, unallocated);
+                    assert_eq!(l, len);
+                    len
+                };
+                debug_assert!(copied > 0);
+                offset += copied;
+            }
         }
         assert_eq!(replaced_buf.len(), self.rx_buffer.len());
 
@@ -9915,17 +9925,76 @@ mod test {
         let mut s = socket_established_with_window_scaling();
         assert_eq!(s.rx_buffer.enqueue_slice(&[42; 31 * 1024]), 31 * 1024);
         assert_eq!(s.rx_buffer.len(), 31 * 1024);
-        assert!(s
-            .replace_recv_buffer(SocketBuffer::new(vec![7u8; 32 * 1024 + 512]))
-            .is_err());
-        assert!(s
-            .replace_recv_buffer(SocketBuffer::new(vec![7u8; 16 * 1024]))
-            .is_err());
+        assert!(
+            s.replace_recv_buffer(SocketBuffer::new(vec![7u8; 32 * 1024 + 512]))
+                .is_err()
+        );
+        assert!(
+            s.replace_recv_buffer(SocketBuffer::new(vec![7u8; 16 * 1024]))
+                .is_err()
+        );
         let old_buffer = s
             .replace_recv_buffer(SocketBuffer::new(vec![7u8; 32 * 1024]))
             .unwrap();
         assert_eq!(old_buffer.capacity(), 64 * 1024);
         assert_eq!(s.rx_buffer.len(), 31 * 1024);
         assert_eq!(s.rx_buffer.capacity(), 32 * 1024);
+    }
+
+    #[test]
+    fn test_resize_recv_buffer_preserves_out_of_order_data() {
+        let mut s = socket_established();
+
+        // Stage data after a gap. It lives in the unallocated part of the
+        // receive buffer and is tracked by the assembler until the gap arrives.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 4,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"efgh"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 64,
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.recv_queue(), 0);
+        assert!(!s.assembler.is_empty());
+
+        // The replacement must account for assembler-tracked data, not just
+        // the contiguous receive queue length.
+        assert!(
+            s.replace_recv_buffer(SocketBuffer::new(vec![0u8; 4]))
+                .is_err()
+        );
+
+        let old_buffer = s
+            .replace_recv_buffer(SocketBuffer::new(vec![0u8; 16]))
+            .unwrap();
+        assert_eq!(old_buffer.capacity(), 64);
+
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcd"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 8),
+                window_len: 8,
+                ..RECV_TEMPL
+            })
+        );
+
+        let mut received = [0; 8];
+        assert_eq!(s.recv_slice(&mut received).unwrap(), 8);
+        assert_eq!(&received, b"abcdefgh");
     }
 }
